@@ -450,6 +450,46 @@ def to_postgresql(
     return grid_id
 
 
+def from_postgresql(
+        grid_id: int,
+        host: str,
+        user: str,
+        password: str,
+        database: str,
+        schema: str,
+        grid_id_column: str = "grid_id",
+        grid_catalogue_name: str = "grid_catalogue",
+        empty_dict_like_object: Optional[dict] = None,
+        grid_tables = None,
+        port: Optional[int] = None
+):
+    """
+    Downloads an existing pandapowerNet from a PostgreSQL database.
+
+    :param int grid_id: unique grid_id that will be used to identify the data for the grid model
+    :param str host: hostname for connecting to the database
+    :param str user: username for logging in
+    :param str password:
+    :param str database: name of the database
+    :param str schema: name of the database schema (e.g. 'postgres')
+    :param str grid_id_column: name of the column for "grid_id" in the PosgreSQL tables, default="grid_id".
+    :param str grid_catalogue_name: name of the catalogue table that includes all grid_id values and the timestamp when
+        the grid data were added
+    :param empty_dict_like_object: If None, the output of pandapower.create_empty_network() is used as an empty element
+        to be filled by the grid data.
+        Give another dict-like object to start filling that alternative object with the data.
+    :param grid_tables:
+    :param port: port for connecting to the database
+    :return: the loaded pandapower network
+    """
+    if not PSYCOPG2_INSTALLED:
+        raise UserWarning("install the package psycopg2 to use PostgreSQL I/O in pandapower")
+
+    with psycopg2.connect(host=host, user=user, password=password, database=database, port=port) as conn:
+        net = from_sql(conn, schema, grid_id, grid_id_column, grid_catalogue_name, empty_dict_like_object, grid_tables)
+
+    return net
+
 def _pandas_dtype_to_spark_type(dtype_str):
     """Map a pandas dtype string to a PySpark DataType instance."""
     dtype_lower = dtype_str.lower()
@@ -545,43 +585,3 @@ def from_spark(spark, db_name):
     net = io_utils.from_dict_of_dfs(dodfs)
     return net
 
-
-def from_postgresql(
-        grid_id: int,
-        host: str,
-        user: str,
-        password: str,
-        database: str,
-        schema: str,
-        grid_id_column: str = "grid_id",
-        grid_catalogue_name: str = "grid_catalogue",
-        empty_dict_like_object: Optional[dict] = None,
-        grid_tables = None,
-        port: Optional[int] = None
-):
-    """
-    Downloads an existing pandapowerNet from a PostgreSQL database.
-
-    :param int grid_id: unique grid_id that will be used to identify the data for the grid model
-    :param str host: hostname for connecting to the database
-    :param str user: username for logging in
-    :param str password:
-    :param str database: name of the database
-    :param str schema: name of the database schema (e.g. 'postgres')
-    :param str grid_id_column: name of the column for "grid_id" in the PosgreSQL tables, default="grid_id".
-    :param str grid_catalogue_name: name of the catalogue table that includes all grid_id values and the timestamp when
-        the grid data were added
-    :param empty_dict_like_object: If None, the output of pandapower.create_empty_network() is used as an empty element
-        to be filled by the grid data.
-        Give another dict-like object to start filling that alternative object with the data.
-    :param grid_tables:
-    :param port: port for connecting to the database
-    :return: the loaded pandapower network
-    """
-    if not PSYCOPG2_INSTALLED:
-        raise UserWarning("install the package psycopg2 to use PostgreSQL I/O in pandapower")
-
-    with psycopg2.connect(host=host, user=user, password=password, database=database, port=port) as conn:
-        net = from_sql(conn, schema, grid_id, grid_id_column, grid_catalogue_name, empty_dict_like_object, grid_tables)
-
-    return net
