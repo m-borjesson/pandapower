@@ -29,6 +29,18 @@ except ImportError:
     sqlite3 = None  # type: ignore[assignment]
     SQLITE_INSTALLED = False
 
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import (
+        StructType, StructField,
+        StringType, LongType, DoubleType, BooleanType, TimestampType
+    )
+
+    PYSPARK_INSTALLED = True
+except ImportError:
+    SparkSession = None  # type: ignore[assignment]
+    PYSPARK_INSTALLED = False
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -436,6 +448,102 @@ def to_postgresql(
     with psycopg2.connect(host=host, user=user, password=password, database=database, port=port) as conn:
         grid_id = to_sql(net, conn, schema, include_results, grid_id, grid_id_column, grid_catalogue_name, index_name)
     return grid_id
+
+
+def _pandas_dtype_to_spark_type(dtype_str):
+    """Map a pandas dtype string to a PySpark DataType instance."""
+    dtype_lower = dtype_str.lower()
+    if "int" in dtype_lower:
+        return LongType()
+    elif "float" in dtype_lower:
+        return DoubleType()
+    elif "bool" in dtype_lower:
+        return BooleanType()
+    elif "datetime" in dtype_lower:
+        return TimestampType()
+    else:
+        return StringType()
+
+
+def _build_spark_schema(df):
+    """Build a PySpark StructType schema from a pandas DataFrame, including its index as first field."""
+    index_df = df.reset_index()
+    fields = [
+        StructField(col, _pandas_dtype_to_spark_type(str(dtype)), nullable=True)
+        for col, dtype in zip(index_df.columns, index_df.dtypes)
+    ]
+    return StructType(fields)
+
+
+def to_spark(net, spark, db_name, include_results=False, overwrite=False):
+    """
+    Saves a pandapowerNet to Spark SQL tables.
+
+    Parameters
+    ----------
+    net : pandapowerNet
+        the grid model to be stored in Spark SQL
+    spark : pyspark.sql.SparkSession
+        the active Spark session
+    db_name : str
+        name of the Spark SQL database to use (will be created if it does not exist)
+    include_results : bool
+        whether to include result tables, default=False
+    overwrite : bool
+        whether to overwrite existing tables if they already exist, default=False.
+        If False and tables already exist, an error is raised.
+    """
+    if not PYSPARK_INSTALLED:
+        raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
+
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+
+    dodfs = io_utils.to_dict_of_dfs(net, include_results=include_results, include_empty_tables=False)
+    write_mode = "overwrite" if overwrite else "error"
+
+    for name, data in dodfs.items():
+        index_df = data.reset_index()
+        schema = _build_spark_schema(data)
+        # Replace pd.NA and np.nan with Python None so Spark stores proper null values.
+        # Converting to object dtype first ensures pd.NA (nullable integer/boolean) is
+        # treated as a null and not as a float "nan" string.
+        clean_df = index_df.astype(object).where(pd.notnull(index_df), None)
+        spark_df = spark.createDataFrame(clean_df, schema=schema)
+        spark_df.write.mode(write_mode).saveAsTable(f"{db_name}.{name}")
+
+
+def from_spark(spark, db_name):
+    """
+    Loads a pandapowerNet from Spark SQL tables.
+
+    Parameters
+    ----------
+    spark : pyspark.sql.SparkSession
+        the active Spark session
+    db_name : str
+        name of the Spark SQL database to read from
+
+    Returns
+    -------
+    net : pandapowerNet
+    """
+    if not PYSPARK_INSTALLED:
+        raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
+
+    tables = spark.sql(f"SHOW TABLES IN {db_name}").collect()
+
+    dodfs = {}
+    for row in tables:
+        table_name = row.tableName
+        spark_df = spark.table(f"{db_name}.{table_name}")
+        pdf = spark_df.toPandas()
+        if "index" in pdf.columns:
+            pdf = pdf.set_index("index")
+            pdf.index.name = None
+        dodfs[table_name] = pdf
+
+    net = io_utils.from_dict_of_dfs(dodfs)
+    return net
 
 
 def from_postgresql(

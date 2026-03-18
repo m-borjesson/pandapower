@@ -17,7 +17,8 @@ from pandapower import reset_results, runpp, pp_dir
 from pandapower.networks import case9, case14, case39, simple_mv_open_ring_net, create_cigre_network_hv, mv_oberrhein
 from pandapower.plotting.geo import convert_geodata_to_geojson
 from pandapower.auxiliary import _preserve_dtypes
-from pandapower.sql_io import download_sql_table, to_postgresql, from_postgresql, delete_postgresql_net
+from pandapower.sql_io import download_sql_table, to_postgresql, from_postgresql, delete_postgresql_net, \
+    to_spark, from_spark
 from pandapower.test import assert_res_equal
 
 try:
@@ -36,6 +37,14 @@ try:
 except ImportError:
     sqlite3 = None  # type: ignore[assignment]
     SQLITE_INSTALLED = False
+
+try:
+    from pyspark.sql import SparkSession
+
+    PYSPARK_INSTALLED = True
+except ImportError:
+    SparkSession = None  # type: ignore[assignment]
+    PYSPARK_INSTALLED = False
 
 
 @pytest.fixture(params=[case9, case14, case39, simple_mv_open_ring_net,
@@ -153,6 +162,52 @@ def test_delete():
     for element in ("bus", "line", "load", "ext_grid", "gen"):
         tab = download_sql_table(cursor, f"{schema}.{element}", grid_id=grid_id)
         assert tab.empty
+
+
+@pytest.fixture(scope="session")
+def spark_session(tmp_path_factory):
+    """Creates a local SparkSession for testing."""
+    warehouse_dir = str(tmp_path_factory.mktemp("spark_warehouse"))
+    spark = (
+        SparkSession.builder
+        .master("local")
+        .appName("pandapower_test")
+        .config("spark.sql.warehouse.dir", warehouse_dir)
+        .config("spark.driver.extraJavaOptions", "-Dderby.system.home=" + warehouse_dir)
+        .getOrCreate()
+    )
+    yield spark
+    spark.stop()
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark is not installed")
+def test_spark(net_in, spark_session):
+    net = copy.deepcopy(net_in)
+    db_name = "test_pandapower_spark"
+    to_spark(net, spark_session, db_name, include_results=False, overwrite=True)
+    net_out = from_spark(spark_session, db_name)
+    for element, table in net.items():
+        if not isinstance(table, pd.DataFrame) or table.empty:
+            continue
+        columns = table.columns
+        table_in = table.fillna(np.nan)
+        if element not in net_out or net_out[element].empty:
+            continue
+        table_out = net_out[element][columns].loc[table_in.index].fillna(np.nan)
+        _preserve_dtypes(table_out, table_in.dtypes)
+        pdt.assert_frame_equal(table_in, table_out, check_dtype=False)
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark is not installed")
+def test_spark_overwrite(spark_session):
+    net = case9()
+    db_name = "test_pandapower_spark_overwrite"
+    to_spark(net, spark_session, db_name, overwrite=True)
+    # writing again without overwrite should raise an error
+    with pytest.raises(Exception):
+        to_spark(net, spark_session, db_name, overwrite=False)
+    # writing again with overwrite should succeed
+    to_spark(net, spark_session, db_name, overwrite=True)
 
 
 if __name__ == "__main__":
