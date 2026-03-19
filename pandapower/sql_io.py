@@ -602,16 +602,111 @@ def _build_spark_schema(df: pd.DataFrame):
     return StructType(fields)
 
 
+def _spark_table_exists(spark, full_table_name: str) -> bool:
+    """Check whether a Spark SQL table exists."""
+    try:
+        spark.table(full_table_name)
+        return True
+    except Exception:
+        return False
+
+
+def _check_spark_catalogue(
+    spark, full_catalogue_name: str, grid_id: Optional[int],
+    grid_id_column: str, download: bool = False
+) -> None:
+    """
+    Validate the Spark grid catalogue table, mirroring check_postgresql_catalogue_table.
+
+    - download=False (upload): ensures catalogue exists (creates if absent) and grid_id is not a duplicate.
+    - download=True (download/delete): ensures catalogue exists and grid_id is present.
+    """
+    exists = _spark_table_exists(spark, full_catalogue_name)
+    if not exists:
+        if download:
+            raise UserWarning(f"grid catalogue {full_catalogue_name} does not exist")
+        # Create an empty catalogue table so subsequent appends work
+        catalogue_schema = StructType([
+            StructField(grid_id_column, LongType(), nullable=False),
+            StructField("timestamp", TimestampType(), nullable=True),
+        ])
+        spark.createDataFrame([], catalogue_schema).write.mode("error").saveAsTable(full_catalogue_name)
+        return
+
+    if grid_id is None:
+        if download:
+            raise UserWarning(f"grid_id ({grid_id_column}) is None: {grid_id}")
+        return  # uploading a new net – auto-assign grid_id later; no duplicate check needed
+
+    count_row = spark.sql(
+        f"SELECT COUNT(*) AS cnt FROM {full_catalogue_name} WHERE {grid_id_column} = {int(grid_id)}"
+    ).collect()
+    found = count_row[0]["cnt"]
+
+    if download and found == 0:
+        raise UserWarning(f"found no entries in {full_catalogue_name} where {grid_id_column}={grid_id}")
+    if not download and found > 0:
+        raise UserWarning(f"found {found} duplicate entries in grid_catalogue where {grid_id_column}={grid_id}")
+
+
+def _create_spark_catalogue_entry(
+    spark, full_catalogue_name: str, grid_id: Optional[int], grid_id_column: str
+) -> int:
+    """
+    Create a new entry in the Spark grid catalogue and return the written grid_id.
+    Mirrors create_postgresql_catalogue_entry.
+    """
+    from datetime import datetime, timezone
+
+    _check_spark_catalogue(spark, full_catalogue_name, grid_id, grid_id_column, download=False)
+
+    if grid_id is None:
+        row = spark.sql(f"SELECT MAX({grid_id_column}) AS max_id FROM {full_catalogue_name}").collect()
+        max_id = row[0]["max_id"]
+        grid_id = 1 if max_id is None else int(max_id) + 1
+    else:
+        grid_id = int(grid_id)
+
+    catalogue_row = pd.DataFrame({
+        grid_id_column: pd.array([grid_id], dtype="Int64"),
+        "timestamp": [datetime.now(tz=timezone.utc)],
+    })
+    catalogue_schema = StructType([
+        StructField(grid_id_column, LongType(), nullable=False),
+        StructField("timestamp", TimestampType(), nullable=True),
+    ])
+    (
+        spark.createDataFrame(catalogue_row, catalogue_schema)
+        .write.mode("append")
+        .saveAsTable(full_catalogue_name)
+    )
+    return grid_id
+
+
+def _spark_delete_rows(spark, full_table_name: str, grid_id_column: str, grid_id: int) -> None:
+    """Remove all rows with the given grid_id from a Spark table."""
+    safe_grid_id = int(grid_id)
+    try:
+        spark.sql(f"DELETE FROM {full_table_name} WHERE {grid_id_column} = {safe_grid_id}")
+    except Exception:
+        # Fallback for non-Delta tables: read → filter → overwrite
+        existing_df = spark.table(full_table_name)
+        filtered_df = existing_df.filter(existing_df[grid_id_column] != safe_grid_id)
+        filtered_df.write.mode("overwrite").saveAsTable(full_table_name)
+
+
 def to_spark(
     net,
     spark,
     schema_name: str,
     include_results: bool = False,
-    overwrite: bool = False,
+    grid_id: Optional[int] = None,
+    grid_id_column: str = "grid_id",
+    grid_catalogue_name: str = "grid_catalogue",
     catalog_name: str | None = None,
-):
+) -> int:
     """
-    Saves a pandapowerNet to Spark SQL tables.
+    Saves a pandapowerNet to Spark SQL tables, with multi-grid support via a grid catalogue.
 
     Parameters
     ----------
@@ -623,10 +718,20 @@ def to_spark(
         Spark schema/database name
     include_results : bool
         whether to include result tables, default=False
-    overwrite : bool
-        whether to overwrite existing tables if they already exist, default=False
+    grid_id : int or None
+        unique grid_id that will be used to identify the data for the grid model.
+        If None, it will be assigned automatically.
+    grid_id_column : str
+        name of the column for "grid_id" in the Spark tables, default="grid_id".
+    grid_catalogue_name : str
+        name of the catalogue table that tracks all grids, default="grid_catalogue".
     catalog_name : str | None
         Spark catalog name, e.g. in Databricks Unity Catalog
+
+    Returns
+    -------
+    grid_id : int
+        the grid_id assigned to the uploaded grid model
     """
     if not PYSPARK_INSTALLED:
         raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
@@ -636,24 +741,39 @@ def to_spark(
     else:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {schema_name}")
 
+    catalogue_full_name = _qualify_table_name(catalog_name, schema_name, grid_catalogue_name)
+    written_grid_id = _create_spark_catalogue_entry(spark, catalogue_full_name, grid_id, grid_id_column)
+
     dodfs = io_utils.to_dict_of_dfs(
         net,
         include_results=include_results,
         include_empty_tables=False,
     )
-    write_mode = "overwrite" if overwrite else "error"
+    dodfs["grid_tables"] = pd.DataFrame(list(dodfs.keys()), columns=["table"])
 
     for name, data in dodfs.items():
-        index_df = data.reset_index()
-        schema = _build_spark_schema(data)
+        data_with_id = data.copy()
+        data_with_id[grid_id_column] = written_grid_id
+
+        schema = _build_spark_schema(data_with_id)
+        index_df = data_with_id.reset_index()
         clean_df = _coerce_pdf_to_spark_schema(index_df, schema)
 
         spark_df = spark.createDataFrame(clean_df, schema=schema)
         full_table_name = _qualify_table_name(catalog_name, schema_name, name)
-        spark_df.write.mode(write_mode).saveAsTable(full_table_name)
+        spark_df.write.mode("append").saveAsTable(full_table_name)
+
+    return written_grid_id
 
 
-def from_spark(spark, schema_name: str, catalog_name: str | None = None):
+def from_spark(
+    spark,
+    schema_name: str,
+    grid_id: int,
+    grid_id_column: str = "grid_id",
+    grid_catalogue_name: str = "grid_catalogue",
+    catalog_name: str | None = None,
+) -> pandapowerNet:
     """
     Loads a pandapowerNet from Spark SQL tables.
 
@@ -663,6 +783,12 @@ def from_spark(spark, schema_name: str, catalog_name: str | None = None):
         the active Spark session
     schema_name : str
         Spark schema/database name
+    grid_id : int
+        unique grid_id that identifies the grid model to load
+    grid_id_column : str
+        name of the column for "grid_id" in the Spark tables, default="grid_id".
+    grid_catalogue_name : str
+        name of the catalogue table that tracks all grids, default="grid_catalogue".
     catalog_name : str | None
         Spark catalog name, e.g. in Databricks Unity Catalog
 
@@ -673,24 +799,94 @@ def from_spark(spark, schema_name: str, catalog_name: str | None = None):
     if not PYSPARK_INSTALLED:
         raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
 
-    if catalog_name:
-        tables = spark.sql(f"SHOW TABLES IN {catalog_name}.{schema_name}").collect()
-    else:
-        tables = spark.sql(f"SHOW TABLES IN {schema_name}").collect()
+    safe_grid_id = int(grid_id)
+    catalogue_full_name = _qualify_table_name(catalog_name, schema_name, grid_catalogue_name)
+    _check_spark_catalogue(spark, catalogue_full_name, safe_grid_id, grid_id_column, download=True)
+
+    grid_tables_full_name = _qualify_table_name(catalog_name, schema_name, "grid_tables")
+    grid_tables_pdf = (
+        spark.table(grid_tables_full_name)
+        .filter(f"{grid_id_column} = {safe_grid_id}")
+        .drop(grid_id_column)
+        .toPandas()
+    )
+    if "index" in grid_tables_pdf.columns:
+        grid_tables_pdf = grid_tables_pdf.set_index("index")
+        grid_tables_pdf.index.name = None
 
     dodfs = {}
-    for row in tables:
-        table_name = row.tableName
-        full_table_name = _qualify_table_name(catalog_name, schema_name, table_name)
-
-        spark_df = spark.table(full_table_name)
-        pdf = spark_df.toPandas()
+    for element in grid_tables_pdf["table"].values:
+        full_table_name = _qualify_table_name(catalog_name, schema_name, element)
+        try:
+            pdf = (
+                spark.table(full_table_name)
+                .filter(f"{grid_id_column} = {safe_grid_id}")
+                .drop(grid_id_column)
+                .toPandas()
+            )
+        except Exception as e:
+            logger.debug(f"skipped {element} due to error: {e}")
+            continue
 
         if "index" in pdf.columns:
             pdf = pdf.set_index("index")
             pdf.index.name = None
 
-        dodfs[table_name] = pdf
+        dodfs[element] = pdf
 
     net = io_utils.from_dict_of_dfs(dodfs)
     return net
+
+
+def delete_spark_net(
+    spark,
+    schema_name: str,
+    grid_id: int,
+    grid_id_column: str = "grid_id",
+    grid_catalogue_name: str = "grid_catalogue",
+    catalog_name: str | None = None,
+) -> None:
+    """
+    Removes a grid model from Spark SQL tables.
+
+    Parameters
+    ----------
+    spark : pyspark.sql.SparkSession
+        the active Spark session
+    schema_name : str
+        Spark schema/database name
+    grid_id : int
+        unique grid_id that identifies the grid model to delete
+    grid_id_column : str
+        name of the column for "grid_id" in the Spark tables, default="grid_id".
+    grid_catalogue_name : str
+        name of the catalogue table that tracks all grids, default="grid_catalogue".
+    catalog_name : str | None
+        Spark catalog name, e.g. in Databricks Unity Catalog
+    """
+    if not PYSPARK_INSTALLED:
+        raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
+
+    safe_grid_id = int(grid_id)
+    catalogue_full_name = _qualify_table_name(catalog_name, schema_name, grid_catalogue_name)
+    _check_spark_catalogue(spark, catalogue_full_name, safe_grid_id, grid_id_column, download=True)
+
+    # Load grid_tables to find which element tables to clean up
+    grid_tables_full_name = _qualify_table_name(catalog_name, schema_name, "grid_tables")
+    grid_tables_pdf = (
+        spark.table(grid_tables_full_name)
+        .filter(f"{grid_id_column} = {safe_grid_id}")
+        .toPandas()
+    )
+    if "index" in grid_tables_pdf.columns:
+        grid_tables_pdf = grid_tables_pdf.set_index("index")
+        grid_tables_pdf.index.name = None
+
+    # Remove rows from every element table, then grid_tables itself
+    for element in list(grid_tables_pdf["table"].values) + ["grid_tables"]:
+        full_table_name = _qualify_table_name(catalog_name, schema_name, element)
+        if _spark_table_exists(spark, full_table_name):
+            _spark_delete_rows(spark, full_table_name, grid_id_column, safe_grid_id)
+
+    # Remove entry from the catalogue
+    _spark_delete_rows(spark, catalogue_full_name, grid_id_column, safe_grid_id)

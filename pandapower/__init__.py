@@ -8,7 +8,7 @@ from pandapower.std_types import *
 from pandapower.create import *
 from pandapower.convert_format import *
 from pandapower.file_io import *
-from pandapower.sql_io import to_postgresql, from_postgresql, delete_postgresql_net, to_sqlite, from_sqlite, to_spark, from_spark
+from pandapower.sql_io import to_postgresql, from_postgresql, delete_postgresql_net, to_sqlite, from_sqlite, to_spark, from_spark, delete_spark_net
 from pandapower.powerflow import *
 from pandapower.optimal_powerflow import OPFNotConverged
 from pandapower.run import *
