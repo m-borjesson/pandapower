@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 from typing import Optional
 
 # Copyright (c) 2016-2026 by University of Kassel and Fraunhofer Institute for Energy Economics
@@ -28,6 +30,30 @@ try:
 except ImportError:
     sqlite3 = None  # type: ignore[assignment]
     SQLITE_INSTALLED = False
+
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import (
+        StructType,
+        StructField,
+        StringType,
+        LongType,
+        DoubleType,
+        BooleanType,
+        TimestampType,
+    )
+
+    PYSPARK_INSTALLED = True
+except ImportError:
+    SparkSession = None  # type: ignore[assignment]
+    StructType = None  # type: ignore[assignment]
+    StructField = None  # type: ignore[assignment]
+    StringType = None  # type: ignore[assignment]
+    LongType = None  # type: ignore[assignment]
+    DoubleType = None  # type: ignore[assignment]
+    BooleanType = None  # type: ignore[assignment]
+    TimestampType = None  # type: ignore[assignment]
+    PYSPARK_INSTALLED = False
 
 import logging
 
@@ -476,4 +502,195 @@ def from_postgresql(
     with psycopg2.connect(host=host, user=user, password=password, database=database, port=port) as conn:
         net = from_sql(conn, schema, grid_id, grid_id_column, grid_catalogue_name, empty_dict_like_object, grid_tables)
 
+    return net
+
+
+def _coerce_pdf_to_spark_schema(pdf: pd.DataFrame, schema) -> pd.DataFrame:
+    """
+    Coerce pandas DataFrame columns to match the provided Spark schema.
+    This avoids Arrow conversion errors when pandas 'object' columns contain
+    floats, ints, bools, timestamps, etc.
+    """
+    coerced = pdf.copy()
+
+    for field in schema.fields:
+        col = field.name
+        spark_type = field.dataType
+
+        if col not in coerced.columns:
+            continue
+
+        series = coerced[col]
+
+        if isinstance(spark_type, StringType):
+            coerced[col] = series.where(series.isna(), series.astype(str))
+
+        elif isinstance(spark_type, LongType):
+            coerced[col] = pd.to_numeric(series, errors="coerce").astype("Int64")
+
+        elif isinstance(spark_type, DoubleType):
+            coerced[col] = pd.to_numeric(series, errors="coerce").astype(float)
+
+        elif isinstance(spark_type, BooleanType):
+
+            def _to_bool(value):
+                if pd.isna(value):
+                    return None
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                if isinstance(value, str):
+                    value_lower = value.strip().lower()
+                    if value_lower in {"true", "1", "yes", "y"}:
+                        return True
+                    if value_lower in {"false", "0", "no", "n"}:
+                        return False
+                return bool(value)
+
+            coerced[col] = series.map(_to_bool).astype(object)
+
+        elif isinstance(spark_type, TimestampType):
+            coerced[col] = pd.to_datetime(series, errors="coerce")
+
+    coerced = coerced.astype(object).where(pd.notnull(coerced), None)
+    return coerced
+
+
+def _qualify_table_name(catalog_name: str | None, schema_name: str, table_name: str) -> str:
+    """
+    Build a fully qualified Spark table name.
+
+    Examples
+    --------
+    catalog_name="dev_sandbox", schema_name="kraftsystemanalys", table_name="bus"
+    -> "dev_sandbox.kraftsystemanalys.bus"
+
+    catalog_name=None, schema_name="kraftsystemanalys", table_name="bus"
+    -> "kraftsystemanalys.bus"
+    """
+    if catalog_name:
+        return f"{catalog_name}.{schema_name}.{table_name}"
+    return f"{schema_name}.{table_name}"
+
+
+def _pandas_dtype_to_spark_type(dtype_str: str):
+    """Map a pandas dtype string to a PySpark DataType instance."""
+    dtype_lower = dtype_str.lower()
+
+    if "int" in dtype_lower:
+        return LongType()
+    if "float" in dtype_lower:
+        return DoubleType()
+    if "bool" in dtype_lower:
+        return BooleanType()
+    if "datetime" in dtype_lower:
+        return TimestampType()
+    return StringType()
+
+
+def _build_spark_schema(df: pd.DataFrame):
+    """
+    Build a PySpark StructType schema from a pandas DataFrame, including its index
+    as the first field after reset_index().
+    """
+    index_df = df.reset_index()
+    fields = [
+        StructField(col, _pandas_dtype_to_spark_type(str(dtype)), nullable=True)
+        for col, dtype in zip(index_df.columns, index_df.dtypes)
+    ]
+    return StructType(fields)
+
+
+def to_spark(
+    net,
+    spark,
+    schema_name: str,
+    include_results: bool = False,
+    overwrite: bool = False,
+    catalog_name: str | None = None,
+):
+    """
+    Saves a pandapowerNet to Spark SQL tables.
+
+    Parameters
+    ----------
+    net : pandapowerNet
+        the grid model to be stored in Spark SQL
+    spark : pyspark.sql.SparkSession
+        the active Spark session
+    schema_name : str
+        Spark schema/database name
+    include_results : bool
+        whether to include result tables, default=False
+    overwrite : bool
+        whether to overwrite existing tables if they already exist, default=False
+    catalog_name : str | None
+        Spark catalog name, e.g. in Databricks Unity Catalog
+    """
+    if not PYSPARK_INSTALLED:
+        raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
+
+    if catalog_name:
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{schema_name}")
+    else:
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {schema_name}")
+
+    dodfs = io_utils.to_dict_of_dfs(
+        net,
+        include_results=include_results,
+        include_empty_tables=False,
+    )
+    write_mode = "overwrite" if overwrite else "error"
+
+    for name, data in dodfs.items():
+        index_df = data.reset_index()
+        schema = _build_spark_schema(data)
+        clean_df = _coerce_pdf_to_spark_schema(index_df, schema)
+
+        spark_df = spark.createDataFrame(clean_df, schema=schema)
+        full_table_name = _qualify_table_name(catalog_name, schema_name, name)
+        spark_df.write.mode(write_mode).saveAsTable(full_table_name)
+
+
+def from_spark(spark, schema_name: str, catalog_name: str | None = None):
+    """
+    Loads a pandapowerNet from Spark SQL tables.
+
+    Parameters
+    ----------
+    spark : pyspark.sql.SparkSession
+        the active Spark session
+    schema_name : str
+        Spark schema/database name
+    catalog_name : str | None
+        Spark catalog name, e.g. in Databricks Unity Catalog
+
+    Returns
+    -------
+    net : pandapowerNet
+    """
+    if not PYSPARK_INSTALLED:
+        raise UserWarning("install pyspark to use Spark SQL I/O in pandapower")
+
+    if catalog_name:
+        tables = spark.sql(f"SHOW TABLES IN {catalog_name}.{schema_name}").collect()
+    else:
+        tables = spark.sql(f"SHOW TABLES IN {schema_name}").collect()
+
+    dodfs = {}
+    for row in tables:
+        table_name = row.tableName
+        full_table_name = _qualify_table_name(catalog_name, schema_name, table_name)
+
+        spark_df = spark.table(full_table_name)
+        pdf = spark_df.toPandas()
+
+        if "index" in pdf.columns:
+            pdf = pdf.set_index("index")
+            pdf.index.name = None
+
+        dodfs[table_name] = pdf
+
+    net = io_utils.from_dict_of_dfs(dodfs)
     return net
