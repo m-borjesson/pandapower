@@ -155,5 +155,156 @@ def test_delete():
         assert tab.empty
 
 
+# ============================================================================
+# Spark SQL I/O tests
+# ============================================================================
+
+try:
+    from pyspark.sql import SparkSession as _SparkSession
+    from pyspark.sql.types import (
+        LongType as _LongType,
+        DoubleType as _DoubleType,
+        BooleanType as _BooleanType,
+        StringType as _StringType,
+        TimestampType as _TimestampType,
+        StructType as _StructType,
+        StructField as _StructField,
+    )
+    PYSPARK_INSTALLED = True
+except ImportError:
+    _SparkSession = None  # type: ignore[assignment]
+    PYSPARK_INSTALLED = False
+
+from pandapower.sql_io import (
+    to_spark, from_spark,
+    _qualify_table_name, _pandas_dtype_to_spark_type,
+    _build_spark_schema, _coerce_pdf_to_spark_schema,
+)
+
+
+def test_qualify_table_name():
+    """_qualify_table_name constructs fully-qualified Spark table names."""
+    assert _qualify_table_name("cat", "sch", "tbl") == "cat.sch.tbl"
+    assert _qualify_table_name(None, "sch", "tbl") == "sch.tbl"
+    assert _qualify_table_name("", "sch", "tbl") == "sch.tbl"  # empty string is falsy
+
+
+def test_to_spark_raises_without_pyspark(monkeypatch):
+    import pandapower.sql_io as _sql_io
+    monkeypatch.setattr(_sql_io, "PYSPARK_INSTALLED", False)
+    with pytest.raises(UserWarning, match="install pyspark"):
+        _sql_io.to_spark(None, None, "test_schema")
+
+
+def test_from_spark_raises_without_pyspark(monkeypatch):
+    import pandapower.sql_io as _sql_io
+    monkeypatch.setattr(_sql_io, "PYSPARK_INSTALLED", False)
+    with pytest.raises(UserWarning, match="install pyspark"):
+        _sql_io.from_spark(None, "test_schema")
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark not installed")
+def test_pandas_dtype_to_spark_type():
+    assert isinstance(_pandas_dtype_to_spark_type("int64"), _LongType)
+    assert isinstance(_pandas_dtype_to_spark_type("int32"), _LongType)
+    assert isinstance(_pandas_dtype_to_spark_type("float64"), _DoubleType)
+    assert isinstance(_pandas_dtype_to_spark_type("float32"), _DoubleType)
+    assert isinstance(_pandas_dtype_to_spark_type("bool"), _BooleanType)
+    assert isinstance(_pandas_dtype_to_spark_type("datetime64[ns]"), _TimestampType)
+    assert isinstance(_pandas_dtype_to_spark_type("object"), _StringType)
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark not installed")
+def test_build_spark_schema():
+    df = pd.DataFrame({
+        "name": pd.Series(["a", "b"], dtype="object"),
+        "value": pd.Series([1.0, 2.0], dtype="float64"),
+        "count": pd.Series([1, 2], dtype="int64"),
+        "flag": pd.Series([True, False], dtype="bool"),
+    })
+    schema = _build_spark_schema(df)
+    field_map = {f.name: type(f.dataType) for f in schema.fields}
+    # reset_index() adds "index" as the first field
+    assert field_map["index"] == _LongType
+    assert field_map["name"] == _StringType
+    assert field_map["value"] == _DoubleType
+    assert field_map["count"] == _LongType
+    assert field_map["flag"] == _BooleanType
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark not installed")
+def test_coerce_pdf_to_spark_schema():
+    schema = _StructType([
+        _StructField("index", _LongType(), nullable=True),
+        _StructField("name", _StringType(), nullable=True),
+        _StructField("value", _DoubleType(), nullable=True),
+        _StructField("flag", _BooleanType(), nullable=True),
+    ])
+    df = pd.DataFrame({
+        "index": [0, 1],
+        "name": pd.Series(["foo", None], dtype="object"),
+        "value": pd.Series([1.5, None], dtype="object"),
+        "flag": pd.Series([True, None], dtype="object"),
+    })
+    coerced = _coerce_pdf_to_spark_schema(df, schema)
+    assert coerced["name"].iloc[0] == "foo"
+    assert coerced["name"].iloc[1] is None
+    assert coerced["value"].iloc[0] == 1.5
+    assert coerced["value"].iloc[1] is None
+    assert coerced["flag"].iloc[0] is True
+    assert coerced["flag"].iloc[1] is None
+
+
+@pytest.fixture(scope="module")
+def spark_local(tmp_path_factory):
+    if not PYSPARK_INSTALLED:
+        pytest.skip("pyspark not installed")
+    warehouse_dir = str(tmp_path_factory.mktemp("spark_warehouse"))
+    spark = (
+        _SparkSession.builder
+        .master("local")
+        .appName("pandapower_test")
+        .config("spark.sql.warehouse.dir", warehouse_dir)
+        .config("spark.driver.memory", "512m")
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
+    yield spark
+    spark.stop()
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark not installed")
+def test_spark_roundtrip(spark_local):
+    """Full to_spark / from_spark roundtrip using a local SparkSession."""
+    net = case9()
+    to_spark(net, spark_local, "pp_roundtrip", overwrite=True)
+    net_out = from_spark(spark_local, "pp_roundtrip")
+    assert len(net_out.bus) == len(net.bus)
+    assert len(net_out.line) == len(net.line)
+    assert len(net_out.load) == len(net.load)
+    assert len(net_out.gen) == len(net.gen)
+    assert len(net_out.ext_grid) == len(net.ext_grid)
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark not installed")
+def test_spark_overwrite(spark_local):
+    """Writing the same schema twice with overwrite=True must succeed."""
+    net = case9()
+    to_spark(net, spark_local, "pp_overwrite", overwrite=True)
+    to_spark(net, spark_local, "pp_overwrite", overwrite=True)
+    net_out = from_spark(spark_local, "pp_overwrite")
+    assert len(net_out.bus) == len(net.bus)
+
+
+@pytest.mark.skipif(not PYSPARK_INSTALLED, reason="pyspark not installed")
+def test_spark_no_overwrite_raises(spark_local):
+    """Writing to an existing schema without overwrite=True must raise an exception."""
+    from pyspark.sql.utils import AnalysisException
+    net = case9()
+    to_spark(net, spark_local, "pp_no_overwrite", overwrite=True)
+    with pytest.raises(AnalysisException):
+        to_spark(net, spark_local, "pp_no_overwrite", overwrite=False)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-xs"])
